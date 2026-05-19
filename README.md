@@ -1,6 +1,8 @@
 # Chatwork MCP Server
 
-Chatwork を AI から操作するための MCP (Model Context Protocol) サーバーです。
+AI から Chatwork にメッセージを届けたり、部屋の様子を見に行ったりできる、小さな MCP (Model Context Protocol) サーバーです。
+
+「この部屋にこの内容を送って」「最近のメッセージを確認して」と自然に頼むだけで、AI が Chatwork API とのやり取りを引き受けます。複数アカウントにも対応しているので、投稿するアカウントを切り替えながら、必要なチャンネル操作だけを軽く使えます。
 
 ## 使い方
 
