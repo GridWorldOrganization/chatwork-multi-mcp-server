@@ -186,6 +186,13 @@ export const listRoomMessagesParamsSchema = z
         .describe(
           '未読にかかわらず最新の100件を取得するか (0: しない, 1: する)',
         ),
+      compact_result: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          'Claude へ返すresultを圧縮するか (false: raw message本文を含める, true: summary のみ)',
+        ),
     }),
   })
   .describe('チャットメッセージ一覧取得');

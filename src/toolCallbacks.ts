@@ -240,7 +240,7 @@ export const listRoomMessages = async (
   const response = await chatworkClient(req.account_id).request({
     path: `/rooms/${req.path.room_id}/messages`,
     method: 'GET',
-    query: req.query,
+    query: { force: req.query.force },
     body: {},
   });
 
@@ -291,6 +291,24 @@ export const listRoomMessages = async (
           {
             type: 'text',
             text: `PARSER_INPUT_SAVE_FAILED: ${(err as Error).message}`,
+          },
+        ],
+      };
+    }
+
+    // compact_result=true の場合、summary のみを返す
+    if (req.query.compact_result === true) {
+      let messageCount = 0;
+      try {
+        const messages = JSON.parse(response.response);
+        messageCount = Array.isArray(messages) ? messages.length : 0;
+      } catch {}
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `CHATWORK_FETCH_SAVED\naccount_id=${accountId}\nroom_id=${req.path.room_id}\nforce=${req.query.force || 0}\nmessage_count=${messageCount}\nsaved_path=${filepath}\nresource_uri=${response.uri}`,
           },
         ],
       };
