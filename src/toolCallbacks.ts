@@ -234,17 +234,57 @@ export const updateRoomMembers = (
     })
     .then(chatworkClientResponseToCallToolResult);
 
-export const listRoomMessages = (
+export const listRoomMessages = async (
   req: z.infer<typeof listRoomMessagesParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
-    .request({
-      path: `/rooms/${req.path.room_id}/messages`,
-      method: 'GET',
-      query: req.query,
-      body: {},
-    })
-    .then(chatworkClientResponseToCallToolResult);
+): Promise<CallToolResult> => {
+  const response = await chatworkClient(req.account_id).request({
+    path: `/rooms/${req.path.room_id}/messages`,
+    method: 'GET',
+    query: req.query,
+    body: {},
+  });
+
+  // API成功時、runtime file保存
+  if (response.ok) {
+    const runtimeRoot = 'C:\\claude_code\\runtime\\makasete\\chatwork-mcp';
+    const accountId = req.account_id || 'default';
+    const accountDir = `${runtimeRoot}\\${accountId}`;
+    const filename = `room-${req.path.room_id}-latest.json`;
+    const filepath = `${accountDir}\\${filename}`;
+
+    const parserInput = JSON.stringify([
+      {
+        type: 'text',
+        text: response.response,
+      },
+      {
+        type: 'text',
+        text: `[Resource from chatwork-multi at ${response.uri}]`,
+      },
+    ]);
+
+    try {
+      await (
+        await import('fs')
+      ).promises.mkdir(accountDir, { recursive: true });
+      await (
+        await import('fs')
+      ).promises.writeFile(filepath, parserInput, 'utf-8');
+    } catch (err) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: `PARSER_INPUT_SAVE_FAILED: ${(err as Error).message}`,
+          },
+        ],
+      };
+    }
+  }
+
+  return chatworkClientResponseToCallToolResult(response);
+};
 
 export const postRoomMessage = (
   req: z.infer<typeof postRoomMessageParamsSchema>,
