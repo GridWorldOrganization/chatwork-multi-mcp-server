@@ -248,6 +248,20 @@ export const listRoomMessages = async (
   if (response.ok) {
     const runtimeRoot = 'C:\\claude_code\\runtime\\makasete\\chatwork-mcp';
     const accountId = req.account_id || 'default';
+
+    // Account ID path safety check - allow only alphanumeric, underscore, and hyphen
+    if (!/^[A-Za-z0-9_-]+$/.test(accountId)) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: 'PARSER_INPUT_INVALID_ACCOUNT_ID',
+          },
+        ],
+      };
+    }
+
     const accountDir = `${runtimeRoot}\\${accountId}`;
     const filename = `room-${req.path.room_id}-latest.json`;
     const filepath = `${accountDir}\\${filename}`;
