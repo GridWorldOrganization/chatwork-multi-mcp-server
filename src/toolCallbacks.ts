@@ -4,7 +4,7 @@ import {
   resolveAccountId,
   ChatworkClientResponse,
 } from './chatworkClient';
-import { store, setRooms, selectPaginatedRooms } from './store';
+import { store, setRooms, selectPaginatedRooms, selectRooms } from './store';
 import { validateRoomsArray } from './types/room';
 import {
   acceptIncomingRequestParamsSchema,
@@ -75,6 +75,44 @@ function chatworkClientResponseToCallToolResult(
       },
     ],
   };
+}
+
+/**
+ * DM room write blocker for account_id="fujino"
+ * Checks room type and throws if attempting to write to a direct message room.
+ * Fail-closed: if room type cannot be determined, blocks the operation.
+ */
+async function checkFujinoDirectRoomWriteBlock(
+  account_id: string,
+  room_id: string | number,
+): Promise<void> {
+  // Only apply to fujino account
+  if (account_id !== 'fujino') {
+    return;
+  }
+
+  const resolvedAccount = resolveAccountId(account_id);
+  const rooms = selectRooms(store.getState(), resolvedAccount);
+
+  if (rooms) {
+    // Try to find the room in cache
+    const room = rooms.find((r) => r.id === Number(room_id));
+    if (room) {
+      if (room.type === 'direct') {
+        throw new Error(
+          `BLOCKED_DM_WRITE: account=${account_id} cannot write to direct room ${room_id}`,
+        );
+      }
+      // Room found and is group or my: allow
+      return;
+    }
+    // Room not found in cache - continue to fail-closed
+  }
+
+  // Cache miss or room not found: fail-closed
+  throw new Error(
+    `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - cannot determine room type`,
+  );
 }
 
 export const getMe = (req: z.infer<typeof accountOnlyParamsSchema>) =>
@@ -318,10 +356,12 @@ export const listRoomMessages = async (
   return chatworkClientResponseToCallToolResult(response);
 };
 
-export const postRoomMessage = (
+export const postRoomMessage = async (
   req: z.infer<typeof postRoomMessageParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
+) => {
+  await checkFujinoDirectRoomWriteBlock(req.account_id, req.path.room_id);
+
+  return chatworkClient(req.account_id)
     .request({
       path: `/rooms/${req.path.room_id}/messages`,
       method: 'POST',
@@ -329,6 +369,7 @@ export const postRoomMessage = (
       body: req.body,
     })
     .then(chatworkClientResponseToCallToolResult);
+};
 
 export const readRoomMessage = (
   req: z.infer<typeof readRoomMessagesParamsSchema>,
@@ -366,10 +407,12 @@ export const getRoomMessage = (
     })
     .then(chatworkClientResponseToCallToolResult);
 
-export const updateRoomMessage = (
+export const updateRoomMessage = async (
   req: z.infer<typeof updateRoomMessageParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
+) => {
+  await checkFujinoDirectRoomWriteBlock(req.account_id, req.path.room_id);
+
+  return chatworkClient(req.account_id)
     .request({
       path: `/rooms/${req.path.room_id}/messages/${req.path.message_id}`,
       method: 'PUT',
@@ -377,11 +420,14 @@ export const updateRoomMessage = (
       body: req.body,
     })
     .then(chatworkClientResponseToCallToolResult);
+};
 
-export const deleteRoomMessage = (
+export const deleteRoomMessage = async (
   req: z.infer<typeof deleteRoomMessageParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
+) => {
+  await checkFujinoDirectRoomWriteBlock(req.account_id, req.path.room_id);
+
+  return chatworkClient(req.account_id)
     .request({
       path: `/rooms/${req.path.room_id}/messages/${req.path.message_id}`,
       method: 'DELETE',
@@ -389,6 +435,7 @@ export const deleteRoomMessage = (
       body: {},
     })
     .then(chatworkClientResponseToCallToolResult);
+};
 
 export const listRoomTasks = (req: z.infer<typeof listRoomTasksParamsSchema>) =>
   chatworkClient(req.account_id)
