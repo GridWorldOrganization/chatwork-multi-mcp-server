@@ -78,25 +78,21 @@ function chatworkClientResponseToCallToolResult(
 }
 
 /**
- * DM room write blocker for account_id="fujino"
+ * DM room write blocker for all accounts
  * Checks room type and throws if attempting to write to a direct message room.
  * Fail-closed: if room type cannot be determined, blocks the operation.
+ * Preflight: on cache miss, fetches room list via GET /rooms to resolve room type.
  */
-async function checkFujinoDirectRoomWriteBlock(
+async function checkDirectRoomWriteBlock(
   account_id: string,
   room_id: string | number,
 ): Promise<void> {
-  // Only apply to fujino account
-  if (account_id !== 'fujino') {
-    return;
-  }
-
   const resolvedAccount = resolveAccountId(account_id);
-  const rooms = selectRooms(store.getState(), resolvedAccount);
+  let rooms = selectRooms(store.getState(), resolvedAccount);
 
   if (rooms) {
     // Try to find the room in cache
-    const room = rooms.find((r) => r.id === Number(room_id));
+    const room = rooms.find((r) => r.room_id === Number(room_id));
     if (room) {
       if (room.type === 'direct') {
         throw new Error(
@@ -106,13 +102,58 @@ async function checkFujinoDirectRoomWriteBlock(
       // Room found and is group or my: allow
       return;
     }
-    // Room not found in cache - continue to fail-closed
+    // Room not found in cache - continue to preflight fetch
   }
 
-  // Cache miss or room not found: fail-closed
-  throw new Error(
-    `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - cannot determine room type`,
-  );
+  // Cache miss or room not found: preflight fetch via GET /rooms
+  const response = await chatworkClient(account_id).request({
+    path: '/rooms',
+    method: 'GET',
+    query: {},
+    body: {},
+  });
+
+  if (!response.ok) {
+    // ChatWork API error: fail-closed
+    throw new Error(
+      `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - preflight GET /rooms failed (status ${response.status})`,
+    );
+  }
+
+  // Parse and validate room list
+  try {
+    const allRooms = validateRoomsArray(JSON.parse(response.response));
+
+    // Update cache with fetched rooms
+    store.dispatch(setRooms({ account: resolvedAccount, data: allRooms, ttl: 5 * 60 * 1000 }));
+
+    // Now try to find room in freshly fetched list
+    const room = allRooms.find((r) => r.room_id === Number(room_id));
+
+    if (!room) {
+      // Room not found in ChatWork API response: fail-closed
+      throw new Error(
+        `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - room not found in ChatWork API`,
+      );
+    }
+
+    if (room.type === 'direct') {
+      throw new Error(
+        `BLOCKED_DM_WRITE: account=${account_id} cannot write to direct room ${room_id}`,
+      );
+    }
+
+    // Room found and is group or my: allow
+    return;
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('BLOCKED_')) {
+      throw err;
+    }
+    // Validation or parse error: fail-closed
+    throw new Error(
+      `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - failed to parse/validate room list: ${(err as Error).message}`,
+    );
+  }
 }
 
 export const getMe = (req: z.infer<typeof accountOnlyParamsSchema>) =>
@@ -359,7 +400,7 @@ export const listRoomMessages = async (
 export const postRoomMessage = async (
   req: z.infer<typeof postRoomMessageParamsSchema>,
 ) => {
-  await checkFujinoDirectRoomWriteBlock(req.account_id, req.path.room_id);
+  await checkDirectRoomWriteBlock(req.account_id, req.path.room_id);
 
   return chatworkClient(req.account_id)
     .request({
@@ -410,7 +451,7 @@ export const getRoomMessage = (
 export const updateRoomMessage = async (
   req: z.infer<typeof updateRoomMessageParamsSchema>,
 ) => {
-  await checkFujinoDirectRoomWriteBlock(req.account_id, req.path.room_id);
+  await checkDirectRoomWriteBlock(req.account_id, req.path.room_id);
 
   return chatworkClient(req.account_id)
     .request({
@@ -425,7 +466,7 @@ export const updateRoomMessage = async (
 export const deleteRoomMessage = async (
   req: z.infer<typeof deleteRoomMessageParamsSchema>,
 ) => {
-  await checkFujinoDirectRoomWriteBlock(req.account_id, req.path.room_id);
+  await checkDirectRoomWriteBlock(req.account_id, req.path.room_id);
 
   return chatworkClient(req.account_id)
     .request({
