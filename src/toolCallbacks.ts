@@ -4,7 +4,7 @@ import {
   resolveAccountId,
   ChatworkClientResponse,
 } from './chatworkClient';
-import { store, setRooms, selectPaginatedRooms } from './store';
+import { store, setRooms, selectPaginatedRooms, selectRooms } from './store';
 import { validateRoomsArray } from './types/room';
 import {
   acceptIncomingRequestParamsSchema,
@@ -75,6 +75,85 @@ function chatworkClientResponseToCallToolResult(
       },
     ],
   };
+}
+
+/**
+ * DM room write blocker for all accounts
+ * Checks room type and throws if attempting to write to a direct message room.
+ * Fail-closed: if room type cannot be determined, blocks the operation.
+ * Preflight: on cache miss, fetches room list via GET /rooms to resolve room type.
+ */
+async function checkDirectRoomWriteBlock(
+  account_id: string,
+  room_id: string | number,
+): Promise<void> {
+  const resolvedAccount = resolveAccountId(account_id);
+  let rooms = selectRooms(store.getState(), resolvedAccount);
+
+  if (rooms) {
+    // Try to find the room in cache
+    const room = rooms.find((r) => r.room_id === Number(room_id));
+    if (room) {
+      if (room.type === 'direct') {
+        throw new Error(
+          `BLOCKED_DM_WRITE: account=${account_id} cannot write to direct room ${room_id}`,
+        );
+      }
+      // Room found and is group or my: allow
+      return;
+    }
+    // Room not found in cache - continue to preflight fetch
+  }
+
+  // Cache miss or room not found: preflight fetch via GET /rooms
+  const response = await chatworkClient(account_id).request({
+    path: '/rooms',
+    method: 'GET',
+    query: {},
+    body: {},
+  });
+
+  if (!response.ok) {
+    // ChatWork API error: fail-closed
+    throw new Error(
+      `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - preflight GET /rooms failed (status ${response.status})`,
+    );
+  }
+
+  // Parse and validate room list
+  try {
+    const allRooms = validateRoomsArray(JSON.parse(response.response));
+
+    // Update cache with fetched rooms
+    store.dispatch(setRooms({ account: resolvedAccount, data: allRooms, ttl: 5 * 60 * 1000 }));
+
+    // Now try to find room in freshly fetched list
+    const room = allRooms.find((r) => r.room_id === Number(room_id));
+
+    if (!room) {
+      // Room not found in ChatWork API response: fail-closed
+      throw new Error(
+        `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - room not found in ChatWork API`,
+      );
+    }
+
+    if (room.type === 'direct') {
+      throw new Error(
+        `BLOCKED_DM_WRITE: account=${account_id} cannot write to direct room ${room_id}`,
+      );
+    }
+
+    // Room found and is group or my: allow
+    return;
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('BLOCKED_')) {
+      throw err;
+    }
+    // Validation or parse error: fail-closed
+    throw new Error(
+      `BLOCKED_ROOM_TYPE_UNRESOLVED: account=${account_id} room=${room_id} - failed to parse/validate room list: ${(err as Error).message}`,
+    );
+  }
 }
 
 export const getMe = (req: z.infer<typeof accountOnlyParamsSchema>) =>
@@ -234,22 +313,96 @@ export const updateRoomMembers = (
     })
     .then(chatworkClientResponseToCallToolResult);
 
-export const listRoomMessages = (
+export const listRoomMessages = async (
   req: z.infer<typeof listRoomMessagesParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
-    .request({
-      path: `/rooms/${req.path.room_id}/messages`,
-      method: 'GET',
-      query: req.query,
-      body: {},
-    })
-    .then(chatworkClientResponseToCallToolResult);
+): Promise<CallToolResult> => {
+  const response = await chatworkClient(req.account_id).request({
+    path: `/rooms/${req.path.room_id}/messages`,
+    method: 'GET',
+    query: { force: req.query.force },
+    body: {},
+  });
 
-export const postRoomMessage = (
+  // API成功時、runtime file保存
+  if (response.ok) {
+    const runtimeRoot = 'C:\\claude_code\\runtime\\makasete\\chatwork-mcp';
+    const accountId = req.account_id || 'default';
+
+    // Account ID path safety check - allow only alphanumeric, underscore, and hyphen
+    if (!/^[A-Za-z0-9_-]+$/.test(accountId)) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: 'PARSER_INPUT_INVALID_ACCOUNT_ID',
+          },
+        ],
+      };
+    }
+
+    const accountDir = `${runtimeRoot}\\${accountId}`;
+    const filename = `room-${req.path.room_id}-latest.json`;
+    const filepath = `${accountDir}\\${filename}`;
+
+    const parserInput = JSON.stringify([
+      {
+        type: 'text',
+        text: response.response,
+      },
+      {
+        type: 'text',
+        text: `[Resource from chatwork-multi at ${response.uri}]`,
+      },
+    ]);
+
+    try {
+      await (
+        await import('fs')
+      ).promises.mkdir(accountDir, { recursive: true });
+      await (
+        await import('fs')
+      ).promises.writeFile(filepath, parserInput, 'utf-8');
+    } catch (err) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: `PARSER_INPUT_SAVE_FAILED: ${(err as Error).message}`,
+          },
+        ],
+      };
+    }
+
+    // compact_result=true の場合、summary のみを返す
+    if (req.query.compact_result === true) {
+      let messageCount = 0;
+      try {
+        const messages = JSON.parse(response.response);
+        messageCount = Array.isArray(messages) ? messages.length : 0;
+      } catch {}
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `CHATWORK_FETCH_SAVED\naccount_id=${accountId}\nroom_id=${req.path.room_id}\nforce=${req.query.force || 0}\nmessage_count=${messageCount}\nsaved_path=${filepath}\nresource_uri=${response.uri}`,
+          },
+        ],
+      };
+    }
+  }
+
+  return chatworkClientResponseToCallToolResult(response);
+};
+
+export const postRoomMessage = async (
   req: z.infer<typeof postRoomMessageParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
+) => {
+  await checkDirectRoomWriteBlock(req.account_id, req.path.room_id);
+
+  return chatworkClient(req.account_id)
     .request({
       path: `/rooms/${req.path.room_id}/messages`,
       method: 'POST',
@@ -257,6 +410,7 @@ export const postRoomMessage = (
       body: req.body,
     })
     .then(chatworkClientResponseToCallToolResult);
+};
 
 export const readRoomMessage = (
   req: z.infer<typeof readRoomMessagesParamsSchema>,
@@ -294,10 +448,12 @@ export const getRoomMessage = (
     })
     .then(chatworkClientResponseToCallToolResult);
 
-export const updateRoomMessage = (
+export const updateRoomMessage = async (
   req: z.infer<typeof updateRoomMessageParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
+) => {
+  await checkDirectRoomWriteBlock(req.account_id, req.path.room_id);
+
+  return chatworkClient(req.account_id)
     .request({
       path: `/rooms/${req.path.room_id}/messages/${req.path.message_id}`,
       method: 'PUT',
@@ -305,11 +461,14 @@ export const updateRoomMessage = (
       body: req.body,
     })
     .then(chatworkClientResponseToCallToolResult);
+};
 
-export const deleteRoomMessage = (
+export const deleteRoomMessage = async (
   req: z.infer<typeof deleteRoomMessageParamsSchema>,
-) =>
-  chatworkClient(req.account_id)
+) => {
+  await checkDirectRoomWriteBlock(req.account_id, req.path.room_id);
+
+  return chatworkClient(req.account_id)
     .request({
       path: `/rooms/${req.path.room_id}/messages/${req.path.message_id}`,
       method: 'DELETE',
@@ -317,6 +476,7 @@ export const deleteRoomMessage = (
       body: {},
     })
     .then(chatworkClientResponseToCallToolResult);
+};
 
 export const listRoomTasks = (req: z.infer<typeof listRoomTasksParamsSchema>) =>
   chatworkClient(req.account_id)
