@@ -21,6 +21,7 @@ import {
   listRoomsParamsSchema,
   listRoomTasksParamsSchema,
   postRoomMessageParamsSchema,
+  postRoomMessageFromFileParamsSchema,
   readRoomMessagesParamsSchema,
   rejectIncomingRequestParamsSchema,
   unreadRoomMessageParamsSchema,
@@ -54,6 +55,7 @@ import {
   listRooms,
   listRoomTasks,
   postRoomMessage,
+  postRoomMessageFromFile,
   readRoomMessage,
   rejectIncomingRequest,
   unreadRoomMessage,
@@ -268,6 +270,16 @@ if (isActive('post_room_message')) {
     'チャットに新しいメッセージを投稿します。',
     postRoomMessageParamsSchema.shape,
     postRoomMessage,
+  );
+}
+// PRESETSには未登録。CHATWORK_ACTIVE_TOOLS で明示的に列挙した場合のみ有効化される。
+// 稼働中MCPを再起動・再設定するまでは、既存プリセット運用に一切影響しない。
+if (isActive('post_room_message_from_file')) {
+  server.tool(
+    'post_room_message_from_file',
+    '本文をファイル経由で渡してチャットに新しいメッセージを投稿します（body文字列をtool inputに含めない）。',
+    postRoomMessageFromFileParamsSchema.shape,
+    postRoomMessageFromFile,
   );
 }
 if (isActive('read_room_messages')) {

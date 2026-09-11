@@ -27,6 +27,7 @@ import {
   listRoomsParamsSchema,
   listRoomTasksParamsSchema,
   postRoomMessageParamsSchema,
+  postRoomMessageFromFileParamsSchema,
   readRoomMessagesParamsSchema,
   rejectIncomingRequestParamsSchema,
   unreadRoomMessageParamsSchema,
@@ -37,6 +38,9 @@ import {
   updateRoomTasksStatusParamsSchema,
 } from './schema';
 import { z } from 'zod';
+import { promises as fsPromises } from 'node:fs';
+import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 
 function chatworkClientResponseToCallToolResult(
   res: ChatworkClientResponse,
@@ -410,6 +414,258 @@ export const postRoomMessage = async (
       body: req.body,
     })
     .then(chatworkClientResponseToCallToolResult);
+};
+
+/**
+ * post_room_message_from_file が読むことを許可するbody fileのroot。
+ * 藤野の送信パイプライン（fujino-outbound-pipeline.ps1）が生成する
+ * outbound-body配下のみを許可する。
+ */
+const POST_FROM_FILE_ALLOWED_ROOT =
+  'C:\\claude_code\\runtime\\makasete\\fujino\\outbound-body';
+
+/**
+ * body fileのサイズ上限（バイト）。
+ *
+ * ChatWork公式の本文バイト数上限は、本リポジトリ内の情報からは確認できない。
+ * したがってこの200,000バイトはChatWork公式の上限値を表すものではなく、
+ * ChatWork APIがこのサイズを実際に受理することを保証するものでもない。
+ * これは、巨大ファイルを誤ってbody_file_pathに指定した場合の誤送信を防ぐための
+ * ローカルな運用上限に過ぎない。値の根拠は、本調査で確認した藤野の実際の
+ * BodyFile運用実績（2026-09-11時点で確認した全ファイルが約1,100バイト未満）に対して、
+ * 十分な余裕を持たせたという一点のみである。
+ */
+const POST_FROM_FILE_MAX_BYTES = 200_000;
+
+export class PostRoomMessageFromFileBlockedError extends Error {
+  constructor(reason: string) {
+    super(`BLOCKED_POST_FROM_FILE: ${reason}`);
+    this.name = 'PostRoomMessageFromFileBlockedError';
+  }
+}
+
+/**
+ * body_file_pathが許可されたroot配下の通常ファイルであることを
+ * realpathベースで検証し、検証済みの絶対パスを返す。
+ *
+ * 単純な文字列prefix判定（startsWith）はsymlink/junction経由のroot脱出を
+ * 検出できないため使用しない。fs.realpathでallowlist rootとtargetの両方を
+ * canonicalizeした上でpath.relativeにより比較する。
+ *
+ * allowedRoot引数は unit test 専用の内部差し替え口である。
+ * public な post_room_message_from_file tool の入力スキーマ
+ * （postRoomMessageFromFileParamsSchema）にはallowlist rootを
+ * 指定するフィールドが存在しないため、MCP呼び出し側からこの引数を
+ * 上書きする経路はない。production実行（postRoomMessageFromFile）は
+ * 必ずデフォルト値のPOST_FROM_FILE_ALLOWED_ROOTを使う。
+ */
+export async function resolveAndValidateBodyFilePath(
+  bodyFilePath: string,
+  allowedRoot: string = POST_FROM_FILE_ALLOWED_ROOT,
+): Promise<string> {
+  let realRoot: string;
+  try {
+    realRoot = await fsPromises.realpath(allowedRoot);
+  } catch (err) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `allowlist root does not exist or is not accessible: ${(err as Error).message}`,
+    );
+  }
+
+  let realTarget: string;
+  try {
+    realTarget = await fsPromises.realpath(bodyFilePath);
+  } catch (err) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `body_file_path does not exist or is not accessible: ${(err as Error).message}`,
+    );
+  }
+
+  // Windowsのパス比較はcase-insensitiveとして扱う。
+  const relative = path.relative(
+    realRoot.toLowerCase(),
+    realTarget.toLowerCase(),
+  );
+
+  if (relative === '') {
+    // targetがroot自身（ディレクトリ）を指しているケース。ファイルではないため拒否。
+    throw new PostRoomMessageFromFileBlockedError(
+      'body_file_path resolves to the allowlist root itself, not a file',
+    );
+  }
+
+  if (
+    relative === '..' ||
+    relative.startsWith('..' + path.sep) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new PostRoomMessageFromFileBlockedError(
+      'body_file_path resolves outside the allowlist root',
+    );
+  }
+
+  const stat = await fsPromises.stat(realTarget);
+  if (!stat.isFile()) {
+    throw new PostRoomMessageFromFileBlockedError(
+      'body_file_path does not resolve to a regular file',
+    );
+  }
+
+  return realTarget;
+}
+
+/**
+ * 検証済みファイルパスから本文を読み込み、サイズ・SHA256・UTF-8妥当性を検証する。
+ *
+ * 順序を厳守する:
+ *   1. statでサイズ確認（0バイト拒否・上限超過拒否）
+ *   2. Bufferとして1回だけread
+ *   3. readしたBuffer自体の実長でも改めて0byte/上限を再確認
+ *      （statとreadの間でファイルが差し替わるTOCTOU的なケースに備える）
+ *   4. そのBufferからSHA256を計算し、expected_sha256とcase-insensitive完全一致を確認
+ *   5. 同じBufferをTextDecoder('utf-8', { fatal: true })でstrict decode
+ * ハッシュ確認後にファイルを再readすることはない。デコード結果はハッシュ計算に
+ * 使ったBufferそのものから得られる。
+ */
+export async function readAndValidateBodyFile(
+  realTarget: string,
+  expectedSha256: string,
+): Promise<string> {
+  const stat = await fsPromises.stat(realTarget);
+
+  if (stat.size === 0) {
+    throw new PostRoomMessageFromFileBlockedError('body_file_path is empty (0 bytes)');
+  }
+
+  if (stat.size > POST_FROM_FILE_MAX_BYTES) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `body_file_path exceeds size limit (${stat.size} > ${POST_FROM_FILE_MAX_BYTES} bytes)`,
+    );
+  }
+
+  let buffer: Buffer;
+  try {
+    buffer = await fsPromises.readFile(realTarget);
+  } catch (err) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `failed to read body_file_path: ${(err as Error).message}`,
+    );
+  }
+
+  // statとreadFileの間でファイル内容が差し替わった場合に備え、
+  // 実際にreadしたBufferの長さでも改めて0byte/上限を確認する。
+  if (buffer.length === 0) {
+    throw new PostRoomMessageFromFileBlockedError(
+      'body_file_path read as empty (0 bytes) despite non-zero stat size',
+    );
+  }
+  if (buffer.length > POST_FROM_FILE_MAX_BYTES) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `body_file_path buffer exceeds size limit (${buffer.length} > ${POST_FROM_FILE_MAX_BYTES} bytes)`,
+    );
+  }
+
+  const actualSha256 = createHash('sha256').update(buffer).digest('hex');
+  if (actualSha256.toLowerCase() !== expectedSha256.toLowerCase()) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `SHA256 mismatch (expected=${expectedSha256.toLowerCase()} actual=${actualSha256})`,
+    );
+  }
+
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let decodedBody: string;
+  try {
+    decodedBody = decoder.decode(buffer);
+  } catch (err) {
+    throw new PostRoomMessageFromFileBlockedError(
+      `body_file_path is not valid UTF-8: ${(err as Error).message}`,
+    );
+  }
+
+  return decodedBody;
+}
+
+/**
+ * 検証済み（SHA256・UTF-8確認済み）の本文文字列を、既存の安全機構
+ * （DM write block・room type check）を通した上でChatWorkへPOSTする。
+ *
+ * ファイルI/Oを一切含まないため、production runtimeのbody fileディレクトリへ
+ * 触れずにunit testできる（DM/room safety・account解決・ChatworkClientへ
+ * 渡るbodyの結線を検証する対象はこの関数）。MCP toolとしては公開しない
+ * （server.tsのtool登録一覧には含まれない）内部関数で、exportはtestからの
+ * 直接呼び出しのためだけに行っている。
+ */
+export async function postMessageBody(
+  accountId: string | undefined,
+  roomId: number,
+  decodedBody: string,
+) {
+  // account_id は optional（string | undefined）なので、既存の resolveAccountId で
+  // canonicalな string へ解決してから、DM write block と ChatworkClient の両方へ
+  // 同じ解決済みIDを渡す（checkDirectRoomWriteBlock 内部でも同じ関数で再解決される
+  // ため二重解決になるが、常に同じ入力に対して同じキーを返す純粋な解決関数であり、
+  // 安全性・キャッシュキーの一貫性に影響はない）。
+  const resolvedAccountId = resolveAccountId(accountId);
+
+  // 既存post_room_messageと同じ安全機構（DM write block・room type check）を必ず通す。
+  await checkDirectRoomWriteBlock(resolvedAccountId, roomId);
+
+  return chatworkClient(resolvedAccountId)
+    .request({
+      path: `/rooms/${roomId}/messages`,
+      method: 'POST',
+      query: {},
+      body: { body: decodedBody },
+    })
+    .then(chatworkClientResponseToCallToolResult);
+}
+
+/**
+ * post_room_message_from_file の実処理本体。
+ *
+ * allowedRoot引数は unit test 専用の内部差し替え口である。
+ * public な post_room_message_from_file tool の入力スキーマ
+ * （postRoomMessageFromFileParamsSchema）にはallowlist rootを指定する
+ * フィールドが存在せず、環境変数によるroot override機構も存在しないため、
+ * MCP呼び出し側からこの引数を上書きする経路はない。
+ * production実行は必ず下記 postRoomMessageFromFile（thin wrapper）経由で
+ * POST_FROM_FILE_ALLOWED_ROOT を渡して呼ばれる。
+ *
+ * 本番と同じ順序（resolve → read/validate → post）で処理するため、
+ * unit testはこの関数をisolated temp rootに対して直接呼ぶことで、
+ * 「production public handlerが内部で実行する処理列」そのものを
+ * production runtimeへ一切書き込まずにend-to-endで検証できる。
+ */
+export async function postRoomMessageFromFileWithAllowedRoot(
+  req: z.infer<typeof postRoomMessageFromFileParamsSchema>,
+  allowedRoot: string,
+) {
+  const realTarget = await resolveAndValidateBodyFilePath(
+    req.body_file_path,
+    allowedRoot,
+  );
+  const decodedBody = await readAndValidateBodyFile(
+    realTarget,
+    req.expected_sha256,
+  );
+
+  return postMessageBody(req.account_id, req.path.room_id, decodedBody);
+}
+
+/**
+ * post_room_message_from_file のpublic MCP handler。
+ *
+ * production固定rootのみを使う薄いwrapper。allowedRootを外部から
+ * 指定・上書きする経路は存在しない（postRoomMessageFromFileWithAllowedRoot
+ * のコメント参照）。
+ */
+export const postRoomMessageFromFile = async (
+  req: z.infer<typeof postRoomMessageFromFileParamsSchema>,
+) => {
+  return postRoomMessageFromFileWithAllowedRoot(
+    req,
+    POST_FROM_FILE_ALLOWED_ROOT,
+  );
 };
 
 export const readRoomMessage = (

@@ -217,6 +217,41 @@ export const postRoomMessageParamsSchema = z
   })
   .describe('チャットメッセージ投稿');
 
+/**
+ * post_room_message_from_file 専用スキーマ。
+ *
+ * Claude（呼び出し元LLM）が日本語本文をtool inputとして再生成する過程で
+ * 文字が別の字へ置き換わる事故（2026-09-11確認）を構造的に防ぐため、
+ * body文字列そのものをtool inputに含めない。呼び出し元は事前にbodyを
+ * 許可ディレクトリ配下のファイルへ書き出し、そのファイルパスとSHA256のみを渡す。
+ * サーバー側がファイルをUTF-8で直接readし、ハッシュ照合済みの同一バイト列を
+ * そのままChatWork APIへ渡す。
+ */
+export const postRoomMessageFromFileParamsSchema = z
+  .object({
+    account_id: accountIdSchema,
+    path: z.object({
+      room_id: z.number().int().describe('ルームID'),
+    }),
+    body_file_path: z
+      .string()
+      .min(1)
+      .describe(
+        'C:\\claude_code\\runtime\\makasete\\fujino\\outbound-body 配下の本文ファイルの絶対パス。' +
+          '本文そのものはここには含めない。',
+      ),
+    expected_sha256: z
+      .string()
+      .regex(/^[0-9A-Fa-f]{64}$/, 'expected_sha256 must be a 64-char hex string')
+      .describe(
+        'body_file_pathの内容（UTF-8バイト列）のSHA256ハッシュ（16進64桁）。' +
+          'サーバー側で読み込んだバイト列のハッシュと完全一致しない場合はPOSTしない。',
+      ),
+  })
+  .describe(
+    '本文をファイル経由で渡すチャットメッセージ投稿（body文字列をtool inputに含めない）',
+  );
+
 /** @see https://developer.chatwork.com/reference/put-rooms-room_id-messages-read */
 export const readRoomMessagesParamsSchema = z
   .object({
